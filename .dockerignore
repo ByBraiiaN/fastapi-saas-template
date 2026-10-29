@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.git/
+node_modules/
+.next/
+logs/
+htmlcov/
+.celerybeat-schedule
+celerybeat-schedule
+celerybeat.pid

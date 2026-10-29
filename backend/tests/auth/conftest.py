@@ -1,0 +1,118 @@
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import select
+from src.auth.models import Provider, User
+from src.hashing import hash_password
+
+from tests.conftest import TestSessionDB
+
+
+@pytest.fixture()
+async def active_user():
+    async with TestSessionDB() as session:
+
+        result = await session.execute(
+            select(User).where(User.email == "active@test.com")
+        )
+        user = result.scalar_one_or_none()
+        if user:
+            user.is_active = True
+            user.is_verified = True
+            user.provider = Provider.LOCAL
+            user.password = await hash_password("123456")
+            await session.commit()
+            return user
+
+        hashed = await hash_password("123456")
+
+        user = User(
+            id=uuid4(),
+            email="active@test.com",
+            username="active_user",
+            password=hashed,          
+            is_active=True,
+            is_verified=True,
+            provider=Provider.LOCAL,        
+        )
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        return user
+
+
+@pytest.fixture()
+async def disabled_user():
+    async with TestSessionDB() as session:
+        result = await session.execute(
+            select(User).where(User.email == "disabled@test.com")
+        )
+        user = result.scalar_one_or_none()
+        if user:
+            return user
+
+        hashed = await hash_password("123456")
+
+        user = User(
+            id=uuid4(),
+            email="disabled@test.com",
+            username="disabled_user",
+            password=hashed,
+            is_active=False,
+            is_verified=False,
+            provider=Provider.LOCAL,
+        )
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        return user
+    
+
+@pytest.fixture
+async def logged_in_user(client, active_user):
+    response = await client.post("/login", json={
+        "email": active_user.email,
+        "password": "123456"
+    })
+    assert response.status_code == 200
+    token = response.json()["token"]
+    refresh_token = response.json()["refresh_token"]
+
+    return {"user": active_user, "token": token, "refresh_token": refresh_token}
+
+
+@pytest.fixture()
+async def unverified_user():
+    async with TestSessionDB() as session:
+        result = await session.execute(
+            select(User).where(User.email == "unverified@test.com")
+        )
+        user = result.scalar_one_or_none()
+        if user:
+            user.is_active = True
+            user.is_verified = False
+            user.provider = Provider.LOCAL
+            user.password = await hash_password("123456")
+            await session.commit()
+            return user
+
+        hashed = await hash_password("123456")
+
+        user = User(
+            id=uuid4(),
+            email="unverified@test.com",
+            username="unverified_user",
+            password=hashed,
+            is_active=True,
+            is_verified=False,
+            provider=Provider.LOCAL,
+        )
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        return user
+
+
+@pytest.fixture
+async def auth_headers(logged_in_user):
+    return {"Authorization": f"Bearer {logged_in_user['token']}"}

@@ -1,0 +1,340 @@
+from datetime import UTC, datetime
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from src.billing.models import (
+    Payment,
+    PaymentProvider,
+    PaymentStatus,
+    Plan,
+    Subscription,
+    SubscriptionStatus,
+)
+from src.paginate import paginate
+
+
+class PlanRepository:
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+
+    async def list_plans(self, active_only: bool = True) -> list[Plan]:
+        stmt = select(Plan)
+        if active_only:
+            stmt = stmt.where(Plan.is_active.is_(True))
+        result = await self.db.execute(stmt.order_by(Plan.price_cents))
+        return list(result.scalars().all())
+
+
+    async def paginate_plans(self, active_only: bool = True, limit: int = 50, offset: int = 0):
+        stmt = select(Plan)
+        if active_only:
+            stmt = stmt.where(Plan.is_active.is_(True))
+        return await paginate(self.db, stmt.order_by(Plan.price_cents), limit=limit, offset=offset)
+    
+
+    async def get_by_id(self, plan_id: UUID) -> Plan | None:
+        result = await self.db.execute(
+            select(Plan).where(Plan.id == plan_id)
+        )
+        return result.scalar_one_or_none()
+    
+
+    async def get_by_code(self, code: str) -> Plan | None:
+        result = await self.db.execute(
+            select(Plan).where(Plan.code == code, Plan.is_active.is_(True))
+        )
+        return result.scalar_one_or_none()
+    
+
+    async def create(self, data: dict) -> Plan:
+        plan = Plan(**data)
+        self.db.add(plan)
+        await self.db.commit()
+        await self.db.refresh(plan)
+        return plan
+    
+
+    async def update(self, plan: Plan, data: dict) -> Plan:
+        for k, v in data.items():
+            if v is not None:
+                setattr(plan, k, v)
+        await self.db.commit()
+        await self.db.refresh(plan)
+        return plan
+    
+
+    async def soft_delete(self, plan: Plan) -> None:
+        plan.is_active = False
+        await self.db.commit()
+    
+
+
+class SubscriptionRepoistory:
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def get_by_provider_subscription_id(
+        self,
+        provider: PaymentProvider,
+        provider_subscription_id: str,
+    ) -> Subscription | None:
+        result = await self.db.execute(
+            select(Subscription)
+            .where(
+                Subscription.provider == provider,
+                Subscription.provider_subscription_id == provider_subscription_id,
+            )
+            .options(
+                selectinload(Subscription.user),
+                selectinload(Subscription.plan),
+            )
+        )
+
+        return result.scalar_one_or_none()
+
+
+    async def list_for_user(self, user_id: UUID) -> list[Subscription]:
+        result = await self.db.execute(
+            select(Subscription)
+            .where(Subscription.user_id == user_id)
+            .order_by(Subscription.started_at.desc())
+        )
+        return list(result.scalars().all())
+
+
+    async def get_subscription_with_access(self, user_id: UUID) -> Subscription | None:
+        now = datetime.now(UTC)
+
+        result = await self.db.execute(
+            select(Subscription)
+            .where(
+                Subscription.user_id == user_id,
+                Subscription.current_period_end > now,
+                Subscription.status.in_(
+                    [
+                        SubscriptionStatus.ACTIVE,
+                        SubscriptionStatus.TRIALING,
+                        SubscriptionStatus.PAST_DUE,
+                        SubscriptionStatus.CANCELED,  # cancel_at_period_end true still allowed
+                    ]
+                ),
+            )
+            .order_by(Subscription.current_period_end.desc())
+            .options(
+                selectinload(Subscription.user),
+                selectinload(Subscription.plan),
+            )
+        )
+        return result.scalar_one_or_none()
+    
+
+    async def create_subscription(self, user_id: UUID, plan_id: UUID, provider: str, 
+            provider_subscription_id: str, provider_customer_id: str, status: SubscriptionStatus,
+            current_period_end: datetime | None = None) -> Subscription:
+        old_sub = await self.get_subscription_with_access(user_id)
+        if old_sub:
+            old_sub.status = SubscriptionStatus.CANCELED
+
+        now = datetime.now(UTC)
+
+        sub = Subscription(
+            user_id=user_id,
+            plan_id=plan_id,
+            status=status,
+            # provider fields
+            provider=provider,
+            provider_subscription_id=provider_subscription_id,
+            provider_customer_id=provider_customer_id,
+
+            started_at=now,
+            current_period_end=current_period_end or now,
+        )
+
+        self.db.add(sub)
+        await self.db.commit()
+        await self.db.refresh(sub)
+
+        result = await self.db.execute(
+        select(Subscription)
+        .where(Subscription.id == sub.id)
+        .options(
+                selectinload(Subscription.user),
+                selectinload(Subscription.plan),
+            )
+        )
+        return result.scalar_one()
+    
+
+    async def cancel_at_period_end(self, subscription: Subscription) -> Subscription:
+        subscription.cancel_at_period_end = True
+        await self.db.commit()
+        await self.db.refresh(subscription)
+        return subscription
+    
+
+    async def cancel_immediately(self, subscription: Subscription) -> Subscription:
+        subscription.status = SubscriptionStatus.CANCELED
+        subscription.current_period_end = datetime.now(UTC)
+        await self.db.commit()
+        await self.db.refresh(subscription)
+        return subscription
+    
+
+    async def update_subscription_period(
+        self,
+        provider: str,
+        provider_subscription_id: str,
+        current_period_start: datetime,
+        current_period_end: datetime,
+    ) -> Subscription | None:
+        result = await self.db.execute(
+            select(Subscription).where(
+                Subscription.provider == provider,
+                Subscription.provider_subscription_id == provider_subscription_id,
+            )
+        )
+        sub = result.scalar_one_or_none()
+        if not sub:
+            return None
+
+        sub.status = SubscriptionStatus.ACTIVE  
+        sub.started_at = current_period_start
+        sub.current_period_end = current_period_end
+
+        await self.db.commit()
+        await self.db.refresh(sub)
+        result = await self.db.execute(
+        select(Subscription)
+        .where(Subscription.id == sub.id)
+        .options(
+                selectinload(Subscription.user),
+                selectinload(Subscription.plan),
+            )
+        )
+        return result.scalar_one()
+    
+
+    async def cancel_subscription(
+        self,
+        provider: str,
+        provider_subscription_id: str,
+        canceled_at: datetime,
+        current_period_end: datetime | None = None,
+    ) -> Subscription | None:
+        result = await self.db.execute(
+            select(Subscription).where(
+                Subscription.provider == provider,
+                Subscription.provider_subscription_id == provider_subscription_id,
+            )
+        )
+        sub = result.scalar_one_or_none()
+        if not sub:
+            print("⚠️ No local subscription found to cancel:", provider_subscription_id)
+            return None
+
+        sub.status = SubscriptionStatus.CANCELED
+        sub.cancel_at_period_end = True
+        sub.canceled_at = canceled_at
+
+        
+        if current_period_end is not None:
+            sub.current_period_end = current_period_end
+
+        await self.db.commit()
+        await self.db.refresh(sub)
+
+        result = await self.db.execute(
+            select(Subscription)
+            .where(Subscription.id == sub.id)
+            .options(
+                selectinload(Subscription.user),
+                selectinload(Subscription.plan),
+            )
+        )
+        return result.scalar_one()
+
+
+    async def update_sub_status(
+            self,
+        provider: str,
+        provider_subscription_id: str,
+        sub_status: SubscriptionStatus,
+    ):
+        result = await self.db.execute(
+            select(Subscription).where(
+                Subscription.provider == provider,
+                Subscription.provider_subscription_id == provider_subscription_id,
+            )
+        )
+        sub = result.scalar_one_or_none()
+        if not sub or sub.status == SubscriptionStatus.CANCELED:
+            return None
+        
+        sub.status = sub_status  
+        await self.db.commit()
+        await self.db.refresh(sub)
+        result = await self.db.execute(
+        select(Subscription)
+        .where(Subscription.id == sub.id)
+        .options(
+                selectinload(Subscription.user),
+                selectinload(Subscription.plan),
+            )
+        )
+        return result.scalar_one()
+        
+
+
+class PaymentRepository:
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+
+    async def create_payment(self,
+        *,
+        user_id: UUID,
+        subscription_id: UUID | None,
+        provider_invoice_id: str,
+        amount_cents: int,
+        currency: str,
+        status: PaymentStatus,
+        provider: PaymentProvider = PaymentProvider.PADDLE,
+    ) -> Payment:
+        
+        payment = Payment(
+            user_id=user_id,
+            subscription_id=subscription_id,
+            provider=provider,
+            provider_invoice_id=provider_invoice_id,
+            amount_cents=amount_cents,
+            currency=currency,
+            status=status,
+        )
+        self.db.add(payment)
+        await self.db.commit()
+        await self.db.refresh(payment)
+        return payment
+    
+
+    async def get_my_payments(self, user_id: UUID) -> list[Payment]:
+        stmt = (
+            select(Payment)
+            .where(Payment.user_id == user_id)
+            .order_by(Payment.created_at.desc())
+        )
+
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
+
+    async def paginate_my_payments(self, user_id: UUID, limit: int = 50, offset: int = 0):
+        stmt = (
+            select(Payment)
+            .where(Payment.user_id == user_id)
+            .order_by(Payment.created_at.desc())
+        )
+        return await paginate(self.db, stmt, limit=limit, offset=offset)

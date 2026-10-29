@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+.mypy_cache/
+.ruff_cache/
+
+# Env
+.env
+.env.test
+
+# Virtual env
+venv/
+.envs/
+.venv/
+.uv/
+
+storage/
+
+# Log files
+logs/
+log/
+*.log
+*.log*
+
+# Frontend
+node_modules/
+.next/
+out/
+dist/
+.turbo/
+.vercel/
+coverage/
+*.local
+*.tsbuildinfo
+next-env.d.ts
+
+# OS / editors / certificates
+.DS_Store
+Thumbs.db
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+
+# __pycache__
+**/__pycache__/
+
+
+celerybeat-schedule
+celerybeat.pid
+
+# Coverage / tests
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+.pytest_cache/
+frontend/node_modules/
+frontend/.next/

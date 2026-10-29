@@ -1,0 +1,114 @@
+name: CI (monorepo)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_pass
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U test_user"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/requirements/*.txt
+      - name: Install backend deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements/requirements.txt -r backend/requirements/requirements-dev.txt
+      - name: Prepare env
+        run: |
+          cp .env.example .env
+          cp .env.example backend/.env
+          {
+            echo "APP_ENV=test"; echo "APP_DEBUG=False"; echo "LOG_TO_FILE=false"; echo "SQL_ECHO=false"
+            echo "DATABASE_URL=postgresql+asyncpg://test_user:test_pass@localhost:5432/test_db"
+            echo "SYNC_DATABASE_URL=postgresql+psycopg://test_user:test_pass@localhost:5432/test_db"
+            echo "TEST_DATABASE_URL=postgresql+asyncpg://test_user:test_pass@localhost:5432/test_db"
+            echo "REDIS_URL=redis://localhost:6379/0"
+            echo "CELERY_WORKER_URL=redis://localhost:6379/0"
+            echo "CELERY_BEAT_URL=redis://localhost:6379/1"
+            echo "PADDLE_API_KEY=test_paddle_key"
+            echo "PADDLE_WEBHOOK_SECRET=test_paddle_secret"
+            echo "PADDLE_ENV=sandbox"
+            echo "FRONTEND_URL=http://localhost:3010"
+            echo "NEXT_PUBLIC_API_URL=http://localhost:8010"
+          } >> .env
+          cp .env backend/.env
+      - name: Ruff + mypy
+        run: |
+          ruff check backend/src backend/tests
+          mypy backend/src
+      - name: Alembic check
+        working-directory: backend
+        run: |
+          alembic upgrade head
+          alembic check
+      - name: Pytest with coverage
+        run: pytest --cov=backend/src --cov-report=html --cov-report=term -q
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: htmlcov
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install + typecheck + build
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build images
+        run: |
+          docker compose build api web
+          docker compose config --quiet

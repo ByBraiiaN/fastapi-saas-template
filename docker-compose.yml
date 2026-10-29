@@ -1,0 +1,162 @@
+name: fastapi-saas-template
+
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fastapi-saas-template-api
+    restart: always
+    env_file:
+      - .env
+    environment:
+      LOG_TO_FILE: "false"
+      SQL_ECHO: "false"
+      # Inside Docker, `localhost` points to the container itself: use service names.
+      # (Your .env keeps localhost for ./scripts/dev.sh outside Docker.)
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-app_db}
+      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-app_db}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_WORKER_URL: redis://redis:6379/0
+      CELERY_BEAT_URL: redis://redis:6379/1
+      # Inside Docker, `localhost` is the container itself: Mailpit is a service.
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+    ports:
+      - "8010:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: sh -c "alembic upgrade head && uvicorn src.main:app --host 0.0.0.0 --port 8000"
+
+  db:
+    image: postgres:16
+    container_name: fastapi-saas-template-db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-app_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: fastapi-saas-template-redis
+    restart: always
+    # No password in development to match REDIS_URL/CELERY_*_URL without auth.
+    command: redis-server
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  celery:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fastapi-saas-template-celery
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-app_db}
+      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-app_db}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_WORKER_URL: redis://redis:6379/0
+      CELERY_BEAT_URL: redis://redis:6379/1
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+    depends_on:
+      api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    command: celery -A src.celery_app.celery_app worker --loglevel=info -Q celery,default,billing
+    # The image healthcheck probes uvicorn's /healthz, which workers do not serve.
+    healthcheck:
+      disable: true
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fastapi-saas-template-celery-beat
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-app_db}
+      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-app_db}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_WORKER_URL: redis://redis:6379/0
+      CELERY_BEAT_URL: redis://redis:6379/1
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+    depends_on:
+      api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    command: celery -A src.celery_app.celery_app beat --loglevel=info
+    healthcheck:
+      disable: true
+
+  mailpit:
+    image: axllent/mailpit
+    container_name: fastapi-saas-template-mailpit
+    restart: always
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: fastapi-saas-template-web
+    restart: always
+    ports:
+      - "3010:3010"
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8010}
+    depends_on:
+      - api
+
+  # Idempotent seeds (NOT executed by a normal `docker compose up`).
+  # Usage: docker compose --profile seed up seed
+  # Equivalent to setup.sh step 5/6 but inside Docker.
+  seed:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    profiles: ["seed"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-app_db}
+      SYNC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-app_db}
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: sh -c "alembic upgrade head && python scripts/seed_plans.py && python scripts/seed_admin.py"
+
+volumes:
+  postgres_data:
+  redis_data:
