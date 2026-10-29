@@ -287,4 +287,4 @@ Full production checklist: [docs/deployment.md](docs/deployment.md).
 
 ## License
 
-MIT. Add the `LICENSE` file when you publish your own copy.
+MIT. See [LICENSE](LICENSE) for the full text.
